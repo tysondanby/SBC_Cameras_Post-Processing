@@ -7,12 +7,13 @@ using Images
 using ColorTypes
 
 
-VIDEO_DIR = raw"M:\SecurityFootage\FrontDoor\testdir"
+VIDEO_DIR = raw"M:\SecurityFootage\FrontDoor\front"
 
 SAMPLE_STRIDE = 30 # Use every Nth frame for median background
+MOTION_STRIDE = 5 # Score every Nth frame for motion
 MOTION_PERCENTILE = 99.5 # Frames above this percentile are motion TODO: unused
-MOTION_THRESHOLD = 1.25 # Absolute motion score threshold.
-DILATION_FRAMES = 60 # Expand motion by +/- this many frames
+MOTION_THRESHOLD = 2.5 # Absolute motion score threshold.
+DILATION_FRAMES = 30 # Expand motion by +/- this many frames
 BLACK_FRAMES = 10 # Separator between events
 
 #FILE HELPERS
@@ -68,21 +69,21 @@ end
 
 #FRAME UTILS
 
-function frame_to_uint8(frame)
+function frame_to_uint8(frame)#TODO: See if can be sped up
     h, w = size(frame)[1:2]
     out = Array{UInt8}(undef, h, w, 3)
 
-    @inbounds for y in 1:h
+    @inbounds Threads.@threads for y in 1:h
         for x in 1:w
 
             p = frame[y,x]
             #println(p.r, p.g, p.b)
-            out[y,x,1] = UInt8(round(Int, 255 * p.r))#TODO: check if this is the correct multiplier
+            out[y,x,1] = UInt8(round(Int, 255 * p.r))
             out[y,x,2] = UInt8(round(Int, 255 * p.g))
             out[y,x,3] = UInt8(round(Int, 255 * p.b))
 
         end
-    end
+    end 
 
     return out
 end
@@ -166,52 +167,16 @@ end
 
 
 #MOTION SCORE
-function motion_score(frame_u8, background;percentile=98, eps=1e-6)
 
-    dr = abs.(Int16.(frame_u8[:,:,1]) .- Int16.(background[:,:,1]))
-    dg = abs.(Int16.(frame_u8[:,:,2]) .- Int16.(background[:,:,2]))
-    db = abs.(Int16.(frame_u8[:,:,3]) .- Int16.(background[:,:,3]))
-
-    mean_r = mean(dr)
-    mean_g = mean(dg)
-    mean_b = mean(db)
-
-    p_r = quantile(vec(dr), percentile/100)
-    p_g = quantile(vec(dg), percentile/100)
-    p_b = quantile(vec(db), percentile/100)
-
-    score_r = p_r / (mean_r + eps)
-    score_g = p_g / (mean_g + eps)
-    score_b = p_b / (mean_b + eps)
-
-    return (score_r + score_g + score_b) / 3
-end
-function motion_score_medium(frame_u8, background;percentile=50, eps=1e-6)
-
-    diff = vec(sum(abs, frame_u8 .- background, dims = 3) ./ 3)
-
-    p = quantile(diff, percentile/100)
-    #m = mean(diff)
-    return p #/ (m + eps)
+function motion_score2(frame_u8, background32, background_sum, npix) #number of pixels in the image times 3 (counting all channels) (frames[i], background32, background_sum, npix)
+    relimg = Float32.(frame_u8) .- (sum(frame_u8)/background_sum)*background32
+    sumrelimg = sum(relimg)
+    return sum(abs.(relimg .- (sumrelimg/npix)))/(sumrelimg + 1)
 end
  
 function motion_score_simple(frame_u8, background)
     #println(typeof(frame_u8),typeof(background))
     return sum(abs.(Int16.(frame_u8) .- Int16.(background)))
-end
-
-function motion_score_fast(frame_u8, background; pix=1000)
-
-    #println(size(frame_u8))
-    #println(size(background))
-    diff = vec(sum(abs, frame_u8 .- background, dims = 3))
-
-    k = pix
-    pivot = length(diff) - k + 1
-
-    partialsort!(diff, pivot; rev=true)
-
-    return mean(@view diff[pivot:end])/3
 end
 
 function dilate_motion(motion::BitVector)
@@ -252,6 +217,20 @@ function find_event_ranges(motion)
     return ranges
 end
 
+function elapsed_string(start_time)
+    s = Dates.value(now() - start_time) ÷ 1000
+
+    h = s ÷ 3600
+    m = (s % 3600) ÷ 60
+    s = s % 60
+
+    return string(
+        lpad(h,2,'0'), ":",
+        lpad(m,2,'0'), ":",
+        lpad(s,2,'0')
+    )
+end
+
 #MAIN
 files = get_video_files(VIDEO_DIR)
 
@@ -277,26 +256,24 @@ writer =
         (h,w),
         framerate=fps
     )
-
-#Threads.@threads 
-for file in files
+process_start_time = now()
+for (fileindex,file) in enumerate(files)
 
     println()
     println("======================================")
+    println("Processing file $fileindex of $(length(files)):")
     println(file)
     println("======================================")
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
-    println("Opening video...")
+    println(elapsed_string(process_start_time))
+    #println(Dates.format(now()-process_start_time, "HH:MM:SS"))
+    println("Opening video and reading frames...")
     reader = VideoIO.openvideo(file)
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
-    println("Reading frames...")#TODO: kinda slow
     frames = Vector{Array{UInt8,3}}()
-
     while !eof(reader)
         frame = read(reader)
         push!(frames, frame_to_uint8(frame))
     end
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
+    println(elapsed_string(process_start_time))
     background = build_background_frames(frames)
     #=
     bgdir = joinpath(VIDEO_DIR, "backgrounds")
@@ -313,37 +290,35 @@ for file in files
     println(bgfile) 
     =#
 
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
+    println(elapsed_string(process_start_time))
     println("Computing motion scores...")
     scores = zeros(Float64, length(frames))
     sumvalues = 0.0
-    for i in 1:1:length(frames)
-        frame = frames[i]
-        scores[i] = motion_score_simple(frame, background)
-        #sumvalues += mean(frame)
+    npix = size(frames[1],1)*size(frames[1],2)*size(frames[1],3)
+    background32 = Float32.(background)
+    background_sum = sum(background)
+    Threads.@threads for i in 1:1:length(frames)
+        scores[i] = motion_score2(frames[i], background32, background_sum, npix)
     end
     #println(scores)
-    #avgbrightness = sumvalues/length(frames)
 
     close(reader)
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
-    println("Computing motion threshold...")
     println("Maximum score: $(maximum(scores))")
     println("Average score: $(mean(scores))")
     thresh = MOTION_THRESHOLD*mean(scores)#TODO: calculate this based on avgbrightness
 
-    println("Motion threshold: ", thresh)
+   # println("Motion threshold: ", thresh)
 
     motion = BitVector(score > thresh for score in scores)
     motion = dilate_motion(motion)
     events = find_event_ranges(motion)
 
-    println(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
+    println(elapsed_string(process_start_time))
     println("Events found: ", length(events))
     println("writing events to output video...")
     black = zeros(UInt8,size(frames[1]))
-    for ev in events
-        println("Frames $(first(ev)) -> $(last(ev))")
+    for (i, ev) in enumerate(events)
+        println("Writing frames $(first(ev)) -> $(last(ev)) (event $i of $(length(events)))")
 
         for idx in ev
             write(writer, frames[idx])
